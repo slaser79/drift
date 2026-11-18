@@ -727,6 +727,408 @@ void main() {
       }
     });
   });
+
+  test(
+      'enforce: revokes stuck holder, fails subsequent ops with marker, rollback reports revoked',
+      () {
+    fakeAsync((async) {
+      var fakeNow = Duration.zero;
+      final previousPolicy = serverTransactionPolicy;
+      serverTransactionPolicy = ServerTransactionPolicy(
+        mode: ServerTransactionMode.enforce,
+        recordAfter: const Duration(seconds: 10),
+        recordEvery: const Duration(seconds: 60),
+        idleLimit: const Duration(seconds: 2),
+        elapsed: () => fakeNow,
+      );
+      final logged = <String>[];
+      final previousPrint = driftRuntimeOptions.debugPrint;
+      driftRuntimeOptions.debugPrint = logged.add;
+      try {
+        final server = DriftServer(testInMemoryDatabase());
+        final c1 = StreamChannelController<Object?>();
+        final c2 = StreamChannelController<Object?>();
+        server.serve(c1.foreign, serialize: true);
+        server.serve(c2.foreign, serialize: true);
+
+        late DatabaseConnection conn1;
+        late DatabaseConnection conn2;
+        connectToRemoteAndInitialize(c1.local, serialize: true)
+            .then((c) => conn1 = c);
+        connectToRemoteAndInitialize(c2.local, serialize: true)
+            .then((c) => conn2 = c);
+        async.elapse(Duration.zero);
+
+        final db1 = TodoDb(conn1);
+        final db2 = TodoDb(conn2);
+        db1.customStatement('CREATE TABLE IF NOT EXISTS items (v INT)');
+        async.elapse(Duration.zero);
+
+        final holdTxn = Completer<void>();
+        Object? txnError;
+        final txn = conn1.executor.beginTransaction();
+        txn.ensureOpen(db1);
+        async.elapse(Duration.zero);
+        txn.runCustom('INSERT INTO items VALUES (1)', const []);
+        async.elapse(Duration.zero);
+
+        // Waiter on conn2.
+        var waiterDone = false;
+        db2.customSelect('SELECT count(*) AS n FROM items').getSingle().then(
+          (row) {
+            expect(row.read<int>('n'), 0);
+            waiterDone = true;
+          },
+        );
+        async.elapse(Duration.zero);
+        expect(waiterDone, isFalse);
+
+        for (var i = 0; i < 3; i++) {
+          fakeNow += const Duration(seconds: 1);
+          async.elapse(const Duration(seconds: 1));
+        }
+
+        expect(waiterDone, isTrue);
+        final revokedLines = logged
+            .where((l) => l.startsWith('drift server: revoked transaction:'))
+            .toList();
+        expect(revokedLines, hasLength(1));
+        expect(revokedLines.single, contains('outcome=rolled_back'));
+
+        // Subsequent statement and commit on revoked txn fail with marker.
+        Object? stmtErr;
+        txn.runCustom('INSERT INTO items VALUES (2)', const []).then<void>(
+          (_) {},
+          onError: (Object e) {
+            stmtErr = e;
+          },
+        );
+        async.elapse(Duration.zero);
+        expect(stmtErr, isA<DriftRemoteException>());
+        expect(stmtErr.toString(), contains('[drift:txn_revoked]'));
+        expect(driftWasRemoteTransactionRevoked(txn), isTrue);
+
+        Object? commitErr;
+        txn.send().then<void>((_) {}, onError: (Object e) {
+          commitErr = e;
+        });
+        async.elapse(Duration.zero);
+        expect(commitErr.toString(), contains('[drift:txn_revoked]'));
+
+        // Rollback on revoked txn succeeds without CouldNotRollBackException.
+        Object? rbErr;
+        txn.rollback().then<void>((_) {}, onError: (Object e) {
+          rbErr = e;
+        });
+        async.elapse(Duration.zero);
+        expect(rbErr, isNull);
+        expect(driftWasRemoteTransactionRevoked(txn), isTrue);
+
+        holdTxn.complete();
+        expect(txnError, isNull);
+        db1.close();
+        db2.close();
+        server.shutdown();
+        async.elapse(Duration.zero);
+      } finally {
+        driftRuntimeOptions.debugPrint = previousPrint;
+        serverTransactionPolicy = previousPolicy;
+      }
+    });
+  });
+
+  test(
+      'enforce: nested savepoint releases innermost first, ignores own outer pipelined waiter, self-wait and E5 fire cleanly',
+      () {
+    fakeAsync((async) {
+      var fakeNow = Duration.zero;
+      final previousPolicy = serverTransactionPolicy;
+      serverTransactionPolicy = ServerTransactionPolicy(
+        mode: ServerTransactionMode.enforce,
+        recordAfter: const Duration(seconds: 10),
+        recordEvery: const Duration(seconds: 60),
+        idleLimit: const Duration(seconds: 2),
+        elapsed: () => fakeNow,
+      );
+      final logged = <String>[];
+      final previousPrint = driftRuntimeOptions.debugPrint;
+      driftRuntimeOptions.debugPrint = logged.add;
+      try {
+        final rollbackOrder = <String>[];
+        final innerMock = MockExecutor();
+        final outerTxn = innerMock.transactions;
+        final nestedTxn = outerTxn.transactions;
+        when(outerTxn.rollback()).thenAnswer((_) async {
+          rollbackOrder.add('outer');
+        });
+        when(nestedTxn.rollback()).thenAnswer((_) async {
+          rollbackOrder.add('nested');
+        });
+
+        final server = DriftServer(DatabaseConnection(innerMock));
+        final c1 = StreamChannelController<Object?>();
+        server.serve(c1.foreign, serialize: false);
+        late DatabaseConnection conn1;
+        connectToRemoteAndInitialize(c1.local, serialize: false)
+            .then((c) => conn1 = c);
+        async.elapse(Duration.zero);
+
+        final user = CustomQueryExecutorUser(
+          schemaVersion: 1,
+          beforeOpenCallback: (_, __, ___) async {},
+        );
+        conn1.executor.ensureOpen(user);
+        async.elapse(Duration.zero);
+
+        final outer = conn1.executor.beginTransaction();
+        outer.ensureOpen(user);
+        async.elapse(Duration.zero);
+        final nested = outer.beginTransaction();
+        nested.ensureOpen(user);
+        async.elapse(Duration.zero);
+
+        // Pipelined outer statement waits behind nested savepoint (inside tree).
+        Object? outerStmtErr;
+        outer.runCustom('INSERT INTO t VALUES (1)', const []).then<void>(
+          (_) {},
+          onError: (Object e) {
+            outerStmtErr = e;
+          },
+        );
+        async.elapse(Duration.zero);
+
+        // Wait 5 * L with ONLY the inside-tree waiter: must NOT revoke!
+        for (var i = 0; i < 10; i++) {
+          fakeNow += const Duration(seconds: 1);
+          async.elapse(const Duration(seconds: 1));
+        }
+        expect(rollbackOrder, isEmpty);
+        expect(outerStmtErr, isNull);
+
+        // E4 + E5: self-wait plain statement from conn1 arrives outside tree.
+        var plainDone = false;
+        conn1.executor.runSelect('SELECT 1', const []).then((_) {
+          plainDone = true;
+        });
+        async.elapse(Duration.zero);
+        expect(plainDone, isFalse);
+
+        // Next tick fires within 1 tick!
+        fakeNow += const Duration(seconds: 1);
+        async.elapse(const Duration(seconds: 1));
+        expect(rollbackOrder, ['nested', 'outer']);
+        expect(outerStmtErr.toString(), contains('[drift:txn_revoked]'));
+        expect(plainDone, isTrue);
+
+        conn1.executor.close();
+        server.shutdown();
+        async.elapse(Duration.zero);
+      } finally {
+        driftRuntimeOptions.debugPrint = previousPrint;
+        serverTransactionPolicy = previousPolicy;
+      }
+    });
+  });
+
+  test(
+      'enforce: exempts in-progress statement (E7) and races safely with #13421 (E8) and #13413 (E9)',
+      () {
+    fakeAsync((async) {
+      var fakeNow = Duration.zero;
+      final previousPolicy = serverTransactionPolicy;
+      serverTransactionPolicy = ServerTransactionPolicy(
+        mode: ServerTransactionMode.enforce,
+        recordAfter: const Duration(seconds: 10),
+        recordEvery: const Duration(seconds: 60),
+        idleLimit: const Duration(seconds: 2),
+        elapsed: () => fakeNow,
+      );
+      final logged = <String>[];
+      final previousPrint = driftRuntimeOptions.debugPrint;
+      driftRuntimeOptions.debugPrint = logged.add;
+      try {
+        var rollbackCount = 0;
+        Completer<void>? slowRollback;
+        final mockExec = MockExecutor();
+        final txnExec = mockExec.transactions;
+        final longQueryGate = Completer<void>();
+        var holdLongQuery = true;
+
+        when(txnExec.runSelect(any, any)).thenAnswer((_) async {
+          if (holdLongQuery) {
+            await longQueryGate.future;
+          }
+          return const [];
+        });
+        when(txnExec.rollback()).thenAnswer((_) async {
+          rollbackCount++;
+          final gate = slowRollback;
+          if (gate != null) await gate.future;
+        });
+
+        final server = DriftServer(DatabaseConnection(mockExec));
+        final c1 = StreamChannelController<Object?>();
+        final c2 = StreamChannelController<Object?>();
+        server.serve(c1.foreign, serialize: false);
+        server.serve(c2.foreign, serialize: false);
+
+        late DatabaseConnection conn1;
+        late DatabaseConnection conn2;
+        connectToRemoteAndInitialize(c1.local, serialize: false)
+            .then((c) => conn1 = c);
+        connectToRemoteAndInitialize(c2.local, serialize: false)
+            .then((c) => conn2 = c);
+        async.elapse(Duration.zero);
+
+        final user = CustomQueryExecutorUser(
+          schemaVersion: 1,
+          beforeOpenCallback: (_, __, ___) async {},
+        );
+        conn1.executor.ensureOpen(user);
+        conn2.executor.ensureOpen(user);
+        async.elapse(Duration.zero);
+
+        // Part A (E7): statement in progress for 3 * L is NOT revoked.
+        final busyTxn = conn1.executor.beginTransaction();
+        busyTxn.ensureOpen(user);
+        async.elapse(Duration.zero);
+        var selectDone = false;
+        busyTxn.runSelect('SELECT 1', const []).then((_) => selectDone = true);
+        conn2.executor.runSelect('SELECT 1', const []);
+        async.elapse(Duration.zero);
+        for (var i = 0; i < 6; i++) {
+          fakeNow += const Duration(seconds: 1);
+          async.elapse(const Duration(seconds: 1));
+        }
+        expect(rollbackCount, 0);
+        expect(selectDone, isFalse);
+        longQueryGate.complete();
+        holdLongQuery = false;
+        async.elapse(Duration.zero);
+        expect(selectDone, isTrue);
+        busyTxn.send();
+        async.elapse(Duration.zero);
+
+        // Part B (E8 + E9): revoke in progress while client calls rollback (#13413)
+        // AND then closes (#13421).
+        slowRollback = Completer<void>();
+        final stuckTxn = conn1.executor.beginTransaction();
+        stuckTxn.ensureOpen(user);
+        async.elapse(Duration.zero);
+        var waiterAfterRevoke = false;
+        conn2.executor.runSelect('SELECT 1', const []).then((_) {
+          waiterAfterRevoke = true;
+        });
+        async.elapse(Duration.zero);
+        for (var i = 0; i < 3; i++) {
+          fakeNow += const Duration(seconds: 1);
+          async.elapse(const Duration(seconds: 1));
+        }
+        expect(rollbackCount, 1);
+
+        // Client rollback arrives while server rollback is still in flight (E9).
+        var clientRollbackDone = false;
+        Object? clientRollbackErr;
+        stuckTxn.rollback().then<void>(
+          (_) => clientRollbackDone = true,
+          onError: (Object e) {
+            clientRollbackErr = e;
+          },
+        );
+        async.elapse(Duration.zero);
+        expect(clientRollbackDone, isFalse);
+
+        // Finish server rollback while client is still waiting for rollback reply.
+        slowRollback!.complete();
+        async.elapse(Duration.zero);
+        expect(rollbackCount, 1);
+        expect(clientRollbackErr, isNull);
+        expect(clientRollbackDone, isTrue);
+        expect(driftWasRemoteTransactionRevoked(stuckTxn), isTrue);
+        expect(waiterAfterRevoke, isTrue);
+        conn1.executor.close();
+        async.elapse(Duration.zero);
+        expect(rollbackCount, 1);
+        expect(
+          logged.where((l) => l.contains('release_error')),
+          isEmpty,
+        );
+
+        // Part C (E8 forward): channel closes (#13421) while _revokeTree is
+        // still awaiting slowRollback -> each executor ended once, 0 release_error.
+        final c2b = StreamChannelController<Object?>();
+        server.serve(c2b.foreign, serialize: false);
+        late DatabaseConnection conn1b;
+        connectToRemoteAndInitialize(c2b.local, serialize: false)
+            .then((c) => conn1b = c);
+        async.elapse(Duration.zero);
+        conn1b.executor.ensureOpen(user);
+        async.elapse(Duration.zero);
+
+        slowRollback = Completer<void>();
+        final stuck1b = conn1b.executor.beginTransaction();
+        stuck1b.ensureOpen(user);
+        async.elapse(Duration.zero);
+        var waiter1bServed = false;
+        conn2.executor.runSelect('SELECT 1', const []).then((_) {
+          waiter1bServed = true;
+        });
+        async.elapse(Duration.zero);
+        for (var i = 0; i < 3; i++) {
+          fakeNow += const Duration(seconds: 1);
+          async.elapse(const Duration(seconds: 1));
+        }
+        expect(rollbackCount, 2);
+        conn1b.executor.close();
+        async.elapse(Duration.zero);
+        expect(rollbackCount, 2);
+        slowRollback!.complete();
+        async.elapse(Duration.zero);
+        expect(rollbackCount, 2);
+        expect(waiter1bServed, isTrue);
+        expect(logged.where((l) => l.contains('release_error')), isEmpty);
+
+        // Part D (E8 reverse): close (#13421) starts rolling back while monitor
+        // tick fires mid-rollback -> monitor skips without double rollback.
+        final c3 = StreamChannelController<Object?>();
+        server.serve(c3.foreign, serialize: false);
+        late DatabaseConnection conn3;
+        connectToRemoteAndInitialize(c3.local, serialize: false)
+            .then((c) => conn3 = c);
+        async.elapse(Duration.zero);
+        conn3.executor.ensureOpen(user);
+        async.elapse(Duration.zero);
+
+        slowRollback = Completer<void>();
+        final revTxn = conn3.executor.beginTransaction();
+        revTxn.ensureOpen(user);
+        async.elapse(Duration.zero);
+        var waiter2Served = false;
+        conn2.executor.runSelect('SELECT 1', const []).then((_) {
+          waiter2Served = true;
+        });
+        async.elapse(Duration.zero);
+        conn3.executor.close();
+        async.elapse(Duration.zero);
+        expect(rollbackCount, 3);
+        for (var i = 0; i < 4; i++) {
+          fakeNow += const Duration(seconds: 1);
+          async.elapse(const Duration(seconds: 1));
+        }
+        expect(rollbackCount, 3);
+        slowRollback!.complete();
+        async.elapse(Duration.zero);
+        expect(waiter2Served, isTrue);
+
+        conn2.executor.close();
+        server.shutdown();
+        async.elapse(Duration.zero);
+      } finally {
+        driftRuntimeOptions.debugPrint = previousPrint;
+        serverTransactionPolicy = previousPolicy;
+      }
+    });
+  });
 }
 
 Stream<Object?> _checkStreamOfSimple(Stream<Object?> source) {

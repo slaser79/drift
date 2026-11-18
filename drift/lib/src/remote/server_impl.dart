@@ -56,6 +56,7 @@ class ServerImplementation implements DriftServer {
   /// as the inner one is released, and must not get the outer executor while
   /// it is still waiting for its own rollback.
   final Set<int> _releasing = {};
+  final Map<int, DriftCommunication> _revoked = {};
   final Completer<void> _done = Completer();
 
   int _nextConnectionId = 0;
@@ -106,6 +107,8 @@ class ServerImplementation implements DriftServer {
       // must never become an uncaught error of the server's isolate.
       _logClosedConnection(null, null, 'release_error', error);
     }).whenComplete(() {
+      _revoked.removeWhere(
+          (id, owner) => owner == comm && !_releasing.contains(id));
       _connectionIds.remove(comm);
     });
   }
@@ -191,8 +194,11 @@ class ServerImplementation implements DriftServer {
     checkIfCancelled();
     if (transactionId != null && !_isUsable(transactionId)) {
       // Released (or being released) while this statement was waiting: its
-      // connection closed. Running it now would run it outside of the
-      // transaction.
+      // connection closed or its transaction was revoked. Running it now would
+      // run it outside of the transaction.
+      if (_revoked.containsKey(transactionId)) {
+        throw StateError('[drift:txn_revoked] executor $transactionId');
+      }
       throw StateError('Executor $transactionId is no longer active');
     }
 
@@ -234,6 +240,9 @@ class ServerImplementation implements DriftServer {
     await _waitForTurn(transactionId);
     if (transactionId == null) return connection;
 
+    if (_revoked.containsKey(transactionId)) {
+      throw StateError('[drift:txn_revoked] executor $transactionId');
+    }
     final executor = _managedExecutors[transactionId];
     if (executor == null || _releasing.contains(transactionId)) {
       // Released, or being released, because its connection closed (see
@@ -246,7 +255,9 @@ class ServerImplementation implements DriftServer {
   }
 
   bool _isUsable(int id) =>
-      _managedExecutors.containsKey(id) && !_releasing.contains(id);
+      _managedExecutors.containsKey(id) &&
+      !_releasing.contains(id) &&
+      !_revoked.containsKey(id);
 
   Future<int> _spawnTransaction(DriftCommunication comm, int? executor) async {
     final parent = await _loadExecutor(executor);
@@ -338,7 +349,7 @@ class ServerImplementation implements DriftServer {
   Future<void> _releaseExecutorsOf(DriftCommunication comm) async {
     final ids = [
       for (final entry in _executorOwners.entries)
-        if (entry.value == comm) entry.key,
+        if (entry.value == comm && !_releasing.contains(entry.key)) entry.key,
     ]..sort((a, b) => b.compareTo(a));
     _releasing.addAll(ids);
 
@@ -410,6 +421,21 @@ class ServerImplementation implements DriftServer {
           await _spawnExclusive(comm, executorId));
     }
 
+    if (action == NestedExecutorControl.rollback &&
+        executorId != null &&
+        _revoked.containsKey(executorId)) {
+      while (_releasing.contains(executorId) &&
+          !_isShuttingDown &&
+          !_backlogUpdated.isClosed) {
+        try {
+          await _backlogUpdated.stream.first;
+        } catch (_) {
+          break;
+        }
+      }
+      return PrimitiveResponsePayload.bool(true);
+    }
+
     final executor = await _loadExecutor(executorId);
     return _runWithTreeActivity(
       executorId,
@@ -456,18 +482,26 @@ class ServerImplementation implements DriftServer {
     );
   }
 
-  void _releaseExecutor(int id, {String outcome = 'released'}) {
+  void _releaseExecutor(
+    int id, {
+    String outcome = 'released',
+    bool notifyIdleEnd = true,
+  }) {
     final tree = _treeForExecutor(id);
     _managedExecutors.remove(id);
     _executorOwners.remove(id);
     _releasing.remove(id);
     _executorBacklog.remove(id);
     _parentOf.remove(id);
+    final revokedOwner = _revoked[id];
+    if (revokedOwner != null && revokedOwner.isClosed) {
+      _revoked.remove(id);
+    }
     if (tree != null) {
       tree.ids.remove(id);
       if (id == tree.rootId || tree.ids.isEmpty) {
         _trees.remove(tree.rootId);
-        if (tree.everRecordedIdle) {
+        if (notifyIdleEnd && tree.everRecordedIdle) {
           _logIdleTransactionEnd(tree, _now(), outcome);
         }
         _stopMonitorTimerIfEmpty();
@@ -625,6 +659,20 @@ class ServerImplementation implements DriftServer {
       }
       if (waitersOutside == 0) continue;
 
+      if (policy.mode == ServerTransactionMode.enforce &&
+          tree.kind == 'transaction' &&
+          tree.awakeIdle >= policy.idleLimit &&
+          !tree.ids.any(
+              (id) => _releasing.contains(id) || _revoked.containsKey(id))) {
+        unawaited(_revokeTree(
+          tree,
+          now: now,
+          waiters: waitersOutside,
+          oldestWait: oldestWait,
+        ));
+        continue;
+      }
+
       if (tree.awakeIdle >= policy.recordAfter) {
         final shouldEmit = tree.lastRecordedAwakeIdle == null ||
             (tree.awakeIdle - tree.lastRecordedAwakeIdle!) >=
@@ -640,6 +688,81 @@ class ServerImplementation implements DriftServer {
           );
         }
       }
+    }
+  }
+
+  Future<void> _revokeTree(
+    _TrackedExecutorTree tree, {
+    required Duration now,
+    required int waiters,
+    required Duration oldestWait,
+  }) async {
+    final ids = tree.ids.toList()..sort((a, b) => b.compareTo(a));
+    final nested = tree.nestedCount;
+    _trees.remove(tree.rootId);
+    _stopMonitorTimerIfEmpty();
+    _releasing.addAll(ids);
+    for (final id in ids) {
+      final owner = _executorOwners[id];
+      if (owner != null) {
+        _revoked[id] = owner;
+      }
+    }
+
+    Object? failure;
+    for (final id in ids) {
+      final executor = _managedExecutors[id];
+      if (executor == null) {
+        _releasing.remove(id);
+        continue;
+      }
+      try {
+        if (executor is TransactionExecutor) {
+          await executor.rollback();
+        } else {
+          await executor.close();
+        }
+      } catch (e) {
+        failure ??= e;
+      } finally {
+        _releaseExecutor(id, notifyIdleEnd: false);
+      }
+    }
+
+    if (tree.everRecordedIdle) {
+      _logIdleTransactionEnd(tree, _now(), 'released');
+    }
+    _logRevokedTransaction(
+      tree,
+      now: now,
+      waiters: waiters,
+      oldestWait: oldestWait,
+      nested: nested,
+      outcome: failure == null ? 'rolled_back' : 'rollback_failed',
+    );
+  }
+
+  void _logRevokedTransaction(
+    _TrackedExecutorTree tree, {
+    required Duration now,
+    required int waiters,
+    required Duration oldestWait,
+    required int nested,
+    required String outcome,
+  }) {
+    try {
+      final ageMs = (now - tree.openedAt).inMilliseconds;
+      final idleMs = tree.awakeIdle.inMilliseconds;
+      final oldestWaitMs = oldestWait.inMilliseconds;
+      driftRuntimeOptions.debugPrint(
+        'drift server: revoked transaction: executor=${tree.rootId} '
+        'conn=${tree.connId} age_ms=${ageMs < 0 ? 0 : ageMs} '
+        'idle_ms=$idleMs waiters=$waiters '
+        'oldest_wait_ms=${oldestWaitMs < 0 ? 0 : oldestWaitMs} '
+        'stmts=${tree.stmts} nested=$nested outcome=$outcome',
+      );
+    } catch (_) {
+      // Logging must not change what the server does.
     }
   }
 

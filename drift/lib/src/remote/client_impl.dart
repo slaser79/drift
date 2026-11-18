@@ -81,8 +81,15 @@ abstract class _BaseExecutor extends QueryExecutor {
   @override
   Future<void> runBatched(BatchedStatements statements) {
     return client._channel
-        .request(ExecuteBatchedStatement(statements, _executorId));
+        .request<ResponsePayload?>(
+            ExecuteBatchedStatement(statements, _executorId))
+        .then((_) {}, onError: (Object error, StackTrace stackTrace) {
+      _noteError(error);
+      Error.throwWithStackTrace(error, stackTrace);
+    });
   }
+
+  void _noteError(Object error) {}
 
   Future<T> _runRequest<T>(
       StatementMethod method, String sql, List<Object?>? args) {
@@ -98,10 +105,15 @@ abstract class _BaseExecutor extends QueryExecutor {
       });
     });
 
-    return client._channel.request<T>(
+    return client._channel
+        .request<T>(
       ExecuteQuery(method, sql, args ?? const [], _executorId),
       requestId: id,
-    );
+    )
+        .then((value) => value, onError: (Object error, StackTrace stackTrace) {
+      _noteError(error);
+      Error.throwWithStackTrace(error, stackTrace);
+    });
   }
 
   Future<int> _intRequest(
@@ -235,9 +247,16 @@ class _RemoteTransactionExecutor extends _BaseExecutor
     return true;
   }
 
-  Future<void> _sendAction(NestedExecutorControl action) {
+  @override
+  void _noteError(Object error) {
+    if (_isRevokedRemoteError(error)) {
+      _wasRevoked = true;
+    }
+  }
+
+  Future<ResponsePayload?> _sendAction(NestedExecutorControl action) {
     return client._channel
-        .request(RunNestedExecutorControl(action, _executorId));
+        .request<ResponsePayload?>(RunNestedExecutorControl(action, _executorId));
   }
 
   @override
@@ -245,7 +264,10 @@ class _RemoteTransactionExecutor extends _BaseExecutor
     // don't do anything if the transaction isn't open yet
     if (_pendingOpen == null) return;
 
-    await _sendAction(NestedExecutorControl.rollback);
+    final response = await _sendAction(NestedExecutorControl.rollback);
+    if (response is PrimitiveResponsePayload && response.message == true) {
+      _wasRevoked = true;
+    }
     _done = true;
   }
 
@@ -254,9 +276,28 @@ class _RemoteTransactionExecutor extends _BaseExecutor
     // don't do anything if the transaction isn't open yet
     if (_pendingOpen == null) return;
 
-    await _sendAction(NestedExecutorControl.commit);
-    _done = true;
+    try {
+      await _sendAction(NestedExecutorControl.commit);
+      _done = true;
+    } catch (error) {
+      _noteError(error);
+      rethrow;
+    }
   }
+}
+
+bool _isRevokedRemoteError(Object error) {
+  if (error is DriftRemoteException) {
+    final cause = error.remoteCause;
+    if (cause is StateError) {
+      return cause.message.contains('[drift:txn_revoked]');
+    }
+    if (cause is String) {
+      return cause.contains('[drift:txn_revoked]');
+    }
+    return cause.toString().contains('[drift:txn_revoked]');
+  }
+  return false;
 }
 
 final class _RemoteExclusiveExecutor extends _BaseExecutor {
