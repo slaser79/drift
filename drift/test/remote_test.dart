@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:async/async.dart';
 import 'package:drift/drift.dart';
 import 'package:drift/remote.dart';
+import 'package:drift/src/remote/communication.dart';
 import 'package:drift/src/remote/protocol.dart';
 import 'package:drift/src/utils/synchronized.dart';
 import 'package:mockito/mockito.dart';
@@ -362,6 +363,113 @@ void main() {
     final client = await connectToRemoteAndInitialize(controller.local);
     await server.shutdown();
     expect(client.executor.dialect, SqlDialect.postgres);
+  });
+
+  test('respond failure becomes an error response', () async {
+    final controller = StreamChannelController<Object?>();
+    var threwOnSuccess = false;
+    final serverSide = controller.foreign.transformSink(
+      StreamSinkTransformer<Object?, Object?>.fromHandlers(
+        handleData: (Object? data, EventSink<Object?> out) {
+          if (!threwOnSuccess && data is SuccessResponse) {
+            threwOnSuccess = true;
+            throw ArgumentError('simulated unsendable success payload');
+          }
+          out.add(data);
+        },
+      ),
+    );
+
+    final logged = <String>[];
+    final previousPrint = driftRuntimeOptions.debugPrint;
+    driftRuntimeOptions.debugPrint = logged.add;
+    addTearDown(() => driftRuntimeOptions.debugPrint = previousPrint);
+
+    final serverComm = DriftCommunication(serverSide, serialize: false);
+    serverComm.setRequestHandler(
+      (request) async => const SelectResult([
+        {'ok': 1}
+      ]),
+    );
+    final clientComm = DriftCommunication(controller.local, serialize: false);
+    addTearDown(() async {
+      await clientComm.close();
+      await serverComm.close();
+    });
+
+    await expectLater(
+      clientComm
+          .request<SelectResult>(NoArgsRequest.terminateAll)
+          .timeout(const Duration(seconds: 1)),
+      throwsA(
+        isA<DriftRemoteException>().having(
+          (DriftRemoteException e) => e.remoteCause,
+          'remoteCause',
+          isA<StateError>().having(
+            (StateError s) => s.message,
+            'message',
+            contains('[drift:respond_failed] ArgumentError'),
+          ),
+        ),
+      ),
+    );
+    expect(
+      logged,
+      contains('drift server: respond failed: type=ArgumentError'),
+    );
+
+    // Control: subsequent normal response succeeds over the same channel.
+    final ok = await clientComm
+        .request<SelectResult>(NoArgsRequest.terminateAll)
+        .timeout(const Duration(seconds: 1));
+    expect(ok.rows, [
+      {'ok': 1}
+    ]);
+  });
+
+  test('respond failure when fallback also fails does not throw unhandled',
+      () async {
+    final controller = StreamChannelController<Object?>();
+    final serverSide = controller.foreign.transformSink(
+      StreamSinkTransformer<Object?, Object?>.fromHandlers(
+        handleData: (Object? data, EventSink<Object?> out) {
+          if (data is SuccessResponse || data is ErrorResponse) {
+            throw StateError('sink broken');
+          }
+          out.add(data);
+        },
+      ),
+    );
+
+    final logged = <String>[];
+    final previousPrint = driftRuntimeOptions.debugPrint;
+    driftRuntimeOptions.debugPrint = logged.add;
+    addTearDown(() => driftRuntimeOptions.debugPrint = previousPrint);
+
+    final uncaught = <Object>[];
+    await runZonedGuarded(() async {
+      final serverComm = DriftCommunication(serverSide, serialize: false);
+      serverComm.setRequestHandler(
+        (request) async => const SelectResult([
+          {'ok': 1}
+        ]),
+      );
+      final clientComm = DriftCommunication(controller.local, serialize: false);
+
+      await expectLater(
+        clientComm
+            .request<SelectResult>(NoArgsRequest.terminateAll)
+            .timeout(const Duration(milliseconds: 200)),
+        throwsA(isA<TimeoutException>()),
+      );
+      await clientComm.close();
+      await serverComm.close();
+    }, (error, _) {
+      uncaught.add(error);
+    });
+
+    expect(uncaught, isEmpty);
+    expect(logged, ['drift server: respond failed: type=StateError']);
   });
 }
 

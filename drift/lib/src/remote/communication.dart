@@ -164,13 +164,67 @@ class DriftCommunication {
       try {
         response = await handler(request);
       } catch (e, s) {
-        return respondError(request, e, s);
+        _respondErrorSafe(request, e, s);
+        return;
       }
 
       if (!isClosed) {
-        respond(request, response);
+        try {
+          respond(request, response);
+        } catch (e, s) {
+          // A response that throws during send/serialization would otherwise
+          // drop an unhandled async error into the isolate and leave the client
+          // waiting forever; convert it into a typed error reply so in-flight
+          // transactions roll back cleanly.
+          _logRespondFailed(e);
+          if (!isClosed) {
+            _respondErrorSafe(
+              request,
+              StateError('[drift:respond_failed] ${e.runtimeType}'),
+              s,
+              isFallback: true,
+            );
+          }
+        }
       }
     });
+  }
+
+  void _logRespondFailed(Object error) {
+    try {
+      driftRuntimeOptions
+          .debugPrint('drift server: respond failed: type=${error.runtimeType}');
+    } catch (_) {
+      // Logging must not change what the server does.
+    }
+  }
+
+  void _respondErrorSafe(
+    Request request,
+    Object error,
+    StackTrace? trace, {
+    bool isFallback = false,
+  }) {
+    try {
+      respondError(request, error, trace);
+    } catch (sendError) {
+      if (!isFallback) {
+        _logRespondFailed(sendError);
+        if (!isClosed) {
+          _respondErrorSafe(
+            request,
+            StateError('[drift:respond_failed] ${sendError.runtimeType}'),
+            null,
+            isFallback: true,
+          );
+        }
+      } else if (trace != null) {
+        // Retry without the stack trace in case trace sending caused the error.
+        try {
+          respondError(request, error);
+        } catch (_) {}
+      }
+    }
   }
 }
 
