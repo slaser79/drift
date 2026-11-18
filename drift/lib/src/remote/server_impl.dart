@@ -8,6 +8,7 @@ import 'package:stream_channel/stream_channel.dart';
 import '../runtime/cancellation_zone.dart';
 import 'communication.dart';
 import 'protocol.dart';
+import 'server_txn_policy.dart';
 
 /// The implementation of a drift server, managing remote channels to send
 /// database requests.
@@ -57,6 +58,14 @@ class ServerImplementation implements DriftServer {
   final Set<int> _releasing = {};
   final Completer<void> _done = Completer();
 
+  int _nextConnectionId = 0;
+  final Map<DriftCommunication, int> _connectionIds = {};
+  final Map<int, int> _parentOf = {};
+  final Map<int, _TrackedExecutorTree> _trees = {};
+  final List<_WaiterEntry> _waiters = [];
+  final Stopwatch _monotonic = Stopwatch()..start();
+  Timer? _monitorTimer;
+
   final StreamController<NotifyTablesUpdated> _tableUpdateNotifications =
       StreamController();
 
@@ -84,6 +93,7 @@ class ServerImplementation implements DriftServer {
     }
 
     final comm = DriftCommunication(channel, serialize: serialize);
+    _connectionIds[comm] = _nextConnectionId++;
     comm.setRequestHandler((request) => _handleRequest(comm, request));
     comm.notify(ServerInfo(connection.dialect));
 
@@ -95,6 +105,8 @@ class ServerImplementation implements DriftServer {
       // Callers such as RunningDriftServer drop this future; an error here
       // must never become an uncaught error of the server's isolate.
       _logClosedConnection(null, null, 'release_error', error);
+    }).whenComplete(() {
+      _connectionIds.remove(comm);
     });
   }
 
@@ -102,6 +114,8 @@ class ServerImplementation implements DriftServer {
   Future<void> shutdown() {
     if (!_isShuttingDown) {
       _isShuttingDown = true;
+      _monitorTimer?.cancel();
+      _monitorTimer = null;
       _done.complete(closeExecutorWhenShutdown ? connection.close() : null);
     }
 
@@ -156,10 +170,16 @@ class ServerImplementation implements DriftServer {
   Future<ResponsePayload> _handleEnsureOpen(
       DriftCommunication comms, EnsureOpen open) async {
     final executor = await _loadExecutor(open.executorId);
-    _knownSchemaVersion = open.schemaVersion;
+    return _runWithTreeActivity(
+      open.executorId,
+      () async {
+        _knownSchemaVersion = open.schemaVersion;
 
-    return PrimitiveResponsePayload.bool(await executor
-        .ensureOpen(_ServerDbUser(this, comms, open.schemaVersion)));
+        return PrimitiveResponsePayload.bool(await executor
+            .ensureOpen(_ServerDbUser(this, comms, open.schemaVersion)));
+      },
+      countStmt: false,
+    );
   }
 
   Future<ResponsePayload?> _runQuery(StatementMethod method, String sql,
@@ -176,26 +196,38 @@ class ServerImplementation implements DriftServer {
       throw StateError('Executor $transactionId is no longer active');
     }
 
-    switch (method) {
-      case StatementMethod.custom:
-        await executor.runCustom(sql, args);
-        return null;
-      case StatementMethod.deleteOrUpdate:
-        return PrimitiveResponsePayload.int(
-            await executor.runDelete(sql, args));
-      case StatementMethod.insert:
-        return PrimitiveResponsePayload.int(
-            await executor.runInsert(sql, args));
-      case StatementMethod.select:
-        return SelectResult(await executor.runSelect(sql, args));
-    }
+    return _runWithTreeActivity(
+      transactionId,
+      () async {
+        switch (method) {
+          case StatementMethod.custom:
+            await executor.runCustom(sql, args);
+            return null;
+          case StatementMethod.deleteOrUpdate:
+            return PrimitiveResponsePayload.int(
+                await executor.runDelete(sql, args));
+          case StatementMethod.insert:
+            return PrimitiveResponsePayload.int(
+                await executor.runInsert(sql, args));
+          case StatementMethod.select:
+            return SelectResult(await executor.runSelect(sql, args));
+        }
+      },
+      countStmt: true,
+    );
   }
 
   Future<ResponsePayload?> _runBatched(
       BatchedStatements stmts, int? transactionId) async {
     final executor = await _loadExecutor(transactionId);
-    await executor.runBatched(stmts);
-    return null;
+    return _runWithTreeActivity(
+      transactionId,
+      () async {
+        await executor.runBatched(stmts);
+        return null;
+      },
+      countStmt: true,
+    );
   }
 
   Future<QueryExecutor> _loadExecutor(int? transactionId) async {
@@ -218,20 +250,44 @@ class ServerImplementation implements DriftServer {
 
   Future<int> _spawnTransaction(DriftCommunication comm, int? executor) async {
     final parent = await _loadExecutor(executor);
-    _checkStillConnected(comm, 'transaction');
-    final transaction = parent.beginTransaction();
-    await transaction
-        .ensureOpen(_ServerDbUser(this, comm, _knownSchemaVersion));
-    return _putOwnedExecutor(
-        comm, transaction, transaction.rollback, 'transaction');
+    return _runWithTreeActivity(
+      executor,
+      () async {
+        _checkStillConnected(comm, 'transaction');
+        final transaction = parent.beginTransaction();
+        await transaction
+            .ensureOpen(_ServerDbUser(this, comm, _knownSchemaVersion));
+        return _putOwnedExecutor(
+          comm,
+          transaction,
+          transaction.rollback,
+          'transaction',
+          parentId: executor,
+        );
+      },
+      countStmt: executor != null,
+    );
   }
 
   Future<int> _spawnExclusive(DriftCommunication comm, int? executor) async {
     final parent = await _loadExecutor(executor);
-    _checkStillConnected(comm, 'exclusive');
-    final exclusive = parent.beginExclusive();
-    await exclusive.ensureOpen(_ServerDbUser(this, comm, _knownSchemaVersion));
-    return _putOwnedExecutor(comm, exclusive, exclusive.close, 'exclusive');
+    return _runWithTreeActivity(
+      executor,
+      () async {
+        _checkStillConnected(comm, 'exclusive');
+        final exclusive = parent.beginExclusive();
+        await exclusive
+            .ensureOpen(_ServerDbUser(this, comm, _knownSchemaVersion));
+        return _putOwnedExecutor(
+          comm,
+          exclusive,
+          exclusive.close,
+          'exclusive',
+          parentId: executor,
+        );
+      },
+      countStmt: executor != null,
+    );
   }
 
   /// A request to open a transaction can wait in the backlog for a long time.
@@ -244,8 +300,12 @@ class ServerImplementation implements DriftServer {
     }
   }
 
-  Future<int> _putOwnedExecutor(DriftCommunication comm, QueryExecutor executor,
-      Future<void> Function() end, String kind) async {
+  Future<int> _putOwnedExecutor(
+      DriftCommunication comm,
+      QueryExecutor executor,
+      Future<void> Function() end,
+      String kind,
+      {int? parentId}) async {
     if (comm.isClosed) {
       // Closed while the executor was being opened: [_releaseExecutorsOf] has
       // already run for this connection, so end it here.
@@ -262,6 +322,8 @@ class ServerImplementation implements DriftServer {
 
     final id = _putExecutor(executor, beforeCurrent: true);
     _executorOwners[id] = comm;
+    _registerExecutorInTree(id, _connectionIds[comm] ?? 0, kind,
+        parentId: parentId);
     return id;
   }
 
@@ -349,50 +411,68 @@ class ServerImplementation implements DriftServer {
     }
 
     final executor = await _loadExecutor(executorId);
-    if (action == NestedExecutorControl.endExclusive) {
-      await executor.close();
-      _releaseExecutor(executorId!);
-      return null;
-    }
-
-    if (executor is! TransactionExecutor) {
-      throw ArgumentError.value(
-        executorId,
-        'transactionId',
-        "Does not reference a transaction. This might happen if you don't "
-            'await all operations made inside a transaction, in which case the '
-            'transaction might complete with pending operations.',
-      );
-    }
-
-    switch (action) {
-      case NestedExecutorControl.commit:
-        await executor.send();
-        // The transaction should only be released if the commit doesn't throw.
-        _releaseExecutor(executorId!);
-        break;
-      case NestedExecutorControl.rollback:
-        // Rollbacks shouldn't fail. Other parts of drift assume the transaction
-        // to be over after a rollback either way, so we always release the
-        // executor in this case.
-        try {
-          await executor.rollback();
-        } finally {
-          _releaseExecutor(executorId!);
+    return _runWithTreeActivity(
+      executorId,
+      () async {
+        if (action == NestedExecutorControl.endExclusive) {
+          await executor.close();
+          _releaseExecutor(executorId!, outcome: 'committed');
+          return null;
         }
-        break;
-      default:
-        assert(false, 'Unknown TransactionControl');
-    }
 
-    return null;
+        if (executor is! TransactionExecutor) {
+          throw ArgumentError.value(
+            executorId,
+            'transactionId',
+            "Does not reference a transaction. This might happen if you don't "
+                'await all operations made inside a transaction, in which case the '
+                'transaction might complete with pending operations.',
+          );
+        }
+
+        switch (action) {
+          case NestedExecutorControl.commit:
+            await executor.send();
+            // The transaction should only be released if the commit doesn't throw.
+            _releaseExecutor(executorId!, outcome: 'committed');
+            break;
+          case NestedExecutorControl.rollback:
+            // Rollbacks shouldn't fail. Other parts of drift assume the transaction
+            // to be over after a rollback either way, so we always release the
+            // executor in this case.
+            try {
+              await executor.rollback();
+            } finally {
+              _releaseExecutor(executorId!, outcome: 'rolled_back');
+            }
+            break;
+          default:
+            assert(false, 'Unknown TransactionControl');
+        }
+
+        return null;
+      },
+      countStmt: true,
+    );
   }
 
-  void _releaseExecutor(int id) {
+  void _releaseExecutor(int id, {String outcome = 'released'}) {
+    final tree = _treeForExecutor(id);
     _managedExecutors.remove(id);
     _executorOwners.remove(id);
     _releasing.remove(id);
     _executorBacklog.remove(id);
+    _parentOf.remove(id);
+    if (tree != null) {
+      tree.ids.remove(id);
+      if (id == tree.rootId || tree.ids.isEmpty) {
+        _trees.remove(tree.rootId);
+        if (tree.everRecordedIdle) {
+          _logIdleTransactionEnd(tree, _now(), outcome);
+        }
+        _stopMonitorTimerIfEmpty();
+      }
+    }
     _notifyActiveExecutorUpdated();
   }
 
@@ -412,7 +492,195 @@ class ServerImplementation implements DriftServer {
     // Don't wait for a backlog update if the current transaction id is active
     if (idIsActive()) return Future.value(null);
 
-    return _backlogUpdated.stream.firstWhere((_) => idIsActive());
+    final waiter = _WaiterEntry(transactionId, _now());
+    _waiters.add(waiter);
+    return _backlogUpdated.stream
+        .firstWhere((_) => idIsActive())
+        .whenComplete(() => _waiters.remove(waiter));
+  }
+
+  Duration _now() => serverTransactionPolicy.elapsed?.call() ?? _monotonic.elapsed;
+
+  int _rootIdOf(int id) {
+    var cur = id;
+    while (_parentOf.containsKey(cur)) {
+      cur = _parentOf[cur]!;
+    }
+    return cur;
+  }
+
+  _TrackedExecutorTree? _treeForExecutor(int? id) {
+    if (id == null) return null;
+    return _trees[_rootIdOf(id)];
+  }
+
+  void _registerExecutorInTree(int id, int connId, String kind,
+      {int? parentId}) {
+    final now = _now();
+    if (parentId != null) {
+      final rootId = _rootIdOf(parentId);
+      final rootTree = _trees[rootId];
+      if (rootTree != null) {
+        _parentOf[id] = parentId;
+        rootTree.ids.add(id);
+        return;
+      }
+    }
+    _trees[id] = _TrackedExecutorTree(
+      rootId: id,
+      connId: connId,
+      kind: kind,
+      openedAt: now,
+      lastIdleMark: now,
+    );
+    _ensureMonitorTimer();
+  }
+
+  Future<T> _runWithTreeActivity<T>(
+    int? executorId,
+    Future<T> Function() body, {
+    required bool countStmt,
+  }) async {
+    final tree = _treeForExecutor(executorId);
+    if (tree == null) return body();
+    final now = _now();
+    tree.inProgress++;
+    tree.awakeIdle = Duration.zero;
+    tree.lastIdleMark = now;
+    if (countStmt) tree.stmts++;
+    try {
+      return await body();
+    } finally {
+      tree.inProgress--;
+      if (tree.inProgress == 0) {
+        final finishedAt = _now();
+        tree.awakeIdle = Duration.zero;
+        tree.lastIdleMark = finishedAt;
+      }
+    }
+  }
+
+  void _ensureMonitorTimer() {
+    if (_monitorTimer != null || _trees.isEmpty || _isShuttingDown) return;
+    _monitorTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => _onMonitorTick(),
+    );
+  }
+
+  void _stopMonitorTimerIfEmpty() {
+    if (_trees.isEmpty || _isShuttingDown) {
+      _monitorTimer?.cancel();
+      _monitorTimer = null;
+    }
+  }
+
+  void _onMonitorTick() {
+    if (_isShuttingDown || _trees.isEmpty) {
+      _stopMonitorTimerIfEmpty();
+      return;
+    }
+    final policy = serverTransactionPolicy;
+    final now = _now();
+    if (policy.mode == ServerTransactionMode.off) {
+      for (final tree in _trees.values) {
+        tree.lastIdleMark = now;
+      }
+      return;
+    }
+
+    for (final tree in List.of(_trees.values)) {
+      if (!_trees.containsKey(tree.rootId)) continue;
+      if (_executorBacklog.isEmpty ||
+          !tree.ids.contains(_executorBacklog.first)) {
+        tree.lastIdleMark = now;
+        continue;
+      }
+      if (tree.inProgress > 0) {
+        tree.lastIdleMark = now;
+        continue;
+      }
+      final tickDelta = now - tree.lastIdleMark;
+      if (tickDelta > Duration.zero) {
+        const maxCredit = Duration(seconds: 2);
+        final credit = tickDelta > maxCredit ? maxCredit : tickDelta;
+        tree.awakeIdle += credit;
+        if (tree.awakeIdle > tree.maxAwakeIdle) {
+          tree.maxAwakeIdle = tree.awakeIdle;
+        }
+      }
+      tree.lastIdleMark = now;
+
+      var waitersOutside = 0;
+      var oldestWait = Duration.zero;
+      for (final waiter in _waiters) {
+        if (waiter.targetExecutorId == null ||
+            !tree.ids.contains(waiter.targetExecutorId)) {
+          waitersOutside++;
+          final wait = now - waiter.startedAt;
+          if (wait > oldestWait) {
+            oldestWait = wait;
+          }
+        }
+      }
+      if (waitersOutside == 0) continue;
+
+      if (tree.awakeIdle >= policy.recordAfter) {
+        final shouldEmit = tree.lastRecordedAwakeIdle == null ||
+            (tree.awakeIdle - tree.lastRecordedAwakeIdle!) >=
+                policy.recordEvery;
+        if (shouldEmit) {
+          tree.everRecordedIdle = true;
+          tree.lastRecordedAwakeIdle = tree.awakeIdle;
+          _logIdleTransaction(
+            tree,
+            now: now,
+            waiters: waitersOutside,
+            oldestWait: oldestWait,
+          );
+        }
+      }
+    }
+  }
+
+  void _logIdleTransaction(
+    _TrackedExecutorTree tree, {
+    required Duration now,
+    required int waiters,
+    required Duration oldestWait,
+  }) {
+    try {
+      final ageMs = (now - tree.openedAt).inMilliseconds;
+      final idleMs = tree.awakeIdle.inMilliseconds;
+      final oldestWaitMs = oldestWait.inMilliseconds;
+      final action = tree.kind == 'transaction'
+          ? 'action=would_revoke'
+          : 'kind=${tree.kind} action=record_only';
+      driftRuntimeOptions.debugPrint(
+        'drift server: idle transaction: executor=${tree.rootId} '
+        'conn=${tree.connId} age_ms=${ageMs < 0 ? 0 : ageMs} '
+        'idle_ms=$idleMs waiters=$waiters '
+        'oldest_wait_ms=${oldestWaitMs < 0 ? 0 : oldestWaitMs} '
+        'stmts=${tree.stmts} nested=${tree.nestedCount} $action',
+      );
+    } catch (_) {
+      // Logging must not change what the server does.
+    }
+  }
+
+  void _logIdleTransactionEnd(
+    _TrackedExecutorTree tree,
+    Duration now,
+    String outcome,
+  ) {
+    try {
+      driftRuntimeOptions.debugPrint(
+        'drift server: idle transaction end: executor=${tree.rootId} '
+        'max_idle_ms=${tree.maxAwakeIdle.inMilliseconds} outcome=$outcome',
+      );
+    } catch (_) {
+      // Logging must not change what the server does.
+    }
   }
 
   void _notifyActiveExecutorUpdated() {
@@ -444,10 +712,52 @@ class _ServerDbUser implements QueryExecutorUser {
   Future<void> beforeOpen(
       QueryExecutor executor, OpeningDetails details) async {
     final id = _server._putExecutor(executor, beforeCurrent: true);
+    _server._registerExecutorInTree(
+      id,
+      _server._connectionIds[connection] ?? 0,
+      'before_open',
+    );
+    var outcome = 'committed';
     try {
       await connection.request<void>(RunBeforeOpen(details, id));
+    } catch (_) {
+      outcome = 'released';
+      rethrow;
     } finally {
-      _server._releaseExecutor(id);
+      _server._releaseExecutor(id, outcome: outcome);
     }
   }
+}
+
+class _TrackedExecutorTree {
+  _TrackedExecutorTree({
+    required this.rootId,
+    required this.connId,
+    required this.kind,
+    required this.openedAt,
+    required this.lastIdleMark,
+  }) : ids = {rootId};
+
+  final int rootId;
+  final int connId;
+  final String kind;
+  final Duration openedAt;
+  final Set<int> ids;
+
+  Duration lastIdleMark;
+  Duration awakeIdle = Duration.zero;
+  Duration maxAwakeIdle = Duration.zero;
+  Duration? lastRecordedAwakeIdle;
+  bool everRecordedIdle = false;
+  int inProgress = 0;
+  int stmts = 0;
+
+  int get nestedCount => ids.length > 1 ? ids.length - 1 : 0;
+}
+
+class _WaiterEntry {
+  _WaiterEntry(this.targetExecutorId, this.startedAt);
+
+  final int? targetExecutorId;
+  final Duration startedAt;
 }

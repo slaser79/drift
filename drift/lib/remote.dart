@@ -61,6 +61,13 @@ import 'src/remote/protocol.dart';
 import 'src/remote/server_impl.dart';
 
 export 'src/remote/communication.dart' show DriftRemoteException;
+export 'src/remote/client_impl.dart'
+    show driftRemoteExecutorId, driftWasRemoteTransactionRevoked;
+export 'src/remote/server_txn_policy.dart'
+    show
+        ServerTransactionMode,
+        ServerTransactionPolicy,
+        serverTransactionPolicy;
 
 /// Serves a drift database connection over any two-way communication channel.
 ///

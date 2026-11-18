@@ -1,11 +1,12 @@
 import 'dart:async';
 
 import 'package:async/async.dart';
-import 'package:drift/drift.dart';
+import 'package:drift/drift.dart' hide isNotNull, isNull;
 import 'package:drift/remote.dart';
 import 'package:drift/src/remote/communication.dart';
 import 'package:drift/src/remote/protocol.dart';
 import 'package:drift/src/utils/synchronized.dart';
+import 'package:fake_async/fake_async.dart';
 import 'package:mockito/mockito.dart';
 import 'package:stream_channel/stream_channel.dart';
 import 'package:test/test.dart';
@@ -470,6 +471,261 @@ void main() {
 
     expect(uncaught, isEmpty);
     expect(logged, ['drift server: respond failed: type=StateError']);
+  });
+
+  test(
+      'idle transaction detector: freeze credit caps tick delta at 2 s and tracks idle_end',
+      () {
+    fakeAsync((async) {
+      var fakeNow = Duration.zero;
+      final previousPolicy = serverTransactionPolicy;
+      serverTransactionPolicy = ServerTransactionPolicy(
+        mode: ServerTransactionMode.record,
+        recordAfter: const Duration(seconds: 3),
+        recordEvery: const Duration(seconds: 60),
+        idleLimit: const Duration(seconds: 30),
+        elapsed: () => fakeNow,
+      );
+      final logged = <String>[];
+      final previousPrint = driftRuntimeOptions.debugPrint;
+      driftRuntimeOptions.debugPrint = logged.add;
+      try {
+        final server = DriftServer(testInMemoryDatabase());
+        final c1 = StreamChannelController<Object?>();
+        final c2 = StreamChannelController<Object?>();
+        server.serve(c1.foreign, serialize: false);
+        server.serve(c2.foreign, serialize: false);
+
+        late DatabaseConnection conn1;
+        late DatabaseConnection conn2;
+        connectToRemoteAndInitialize(c1.local, serialize: false)
+            .then((c) => conn1 = c);
+        connectToRemoteAndInitialize(c2.local, serialize: false)
+            .then((c) => conn2 = c);
+        async.flushMicrotasks();
+
+        final user = CustomQueryExecutorUser(
+          schemaVersion: 1,
+          beforeOpenCallback: (_, __, ___) async {},
+        );
+        conn1.executor.ensureOpen(user);
+        conn2.executor.ensureOpen(user);
+        async.flushMicrotasks();
+
+        final txn = conn1.executor.beginTransaction();
+        expect(driftRemoteExecutorId(txn), isNull);
+        txn.ensureOpen(user);
+        async.flushMicrotasks();
+        final xid = driftRemoteExecutorId(txn);
+        expect(xid, isNotNull);
+        expect(driftWasRemoteTransactionRevoked(txn), isFalse);
+
+        // External waiter starts waiting.
+        var waiterDone = false;
+        conn2.executor.runSelect('SELECT 1', const []).then((_) {
+          waiterDone = true;
+        });
+        async.flushMicrotasks();
+        expect(waiterDone, isFalse);
+
+        // Tick 1 (1s) -> idle = 1s (below 3s).
+        fakeNow += const Duration(seconds: 1);
+        async.elapse(const Duration(seconds: 1));
+        expect(logged.where((l) => l.startsWith('drift server: idle')), isEmpty);
+
+        // Simulated OS freeze: stopwatch jumps 300s between two ticks.
+        fakeNow += const Duration(seconds: 300);
+        async.elapse(const Duration(seconds: 1));
+        // Awake idle grew by at most 2s (1s + 2s = 3s == recordAfter).
+        final idleLines = logged
+            .where((l) => l.startsWith('drift server: idle transaction:'))
+            .toList();
+        expect(idleLines, hasLength(1));
+        expect(idleLines.single, contains('executor=$xid'));
+        expect(idleLines.single, contains('idle_ms=3000'));
+        expect(idleLines.single, contains('waiters=1'));
+        expect(idleLines.single, contains('action=would_revoke'));
+        expect(waiterDone, isFalse);
+
+        // Commit ends the tree and logs idle_end with max_idle_ms=3000.
+        txn.send();
+        async.elapse(Duration.zero);
+        expect(waiterDone, isTrue);
+
+        final endLines = logged
+            .where((l) => l.startsWith('drift server: idle transaction end:'))
+            .toList();
+        expect(endLines, hasLength(1));
+        expect(endLines.single, contains('executor=$xid'));
+        expect(endLines.single, contains('max_idle_ms=3000'));
+        expect(endLines.single, contains('outcome=committed'));
+
+        conn1.executor.close();
+        conn2.executor.close();
+        server.shutdown();
+        async.elapse(Duration.zero);
+      } finally {
+        driftRuntimeOptions.debugPrint = previousPrint;
+        serverTransactionPolicy = previousPolicy;
+      }
+    });
+  });
+
+  test('idle transaction detector: busy transaction and no-waiter control emit nothing',
+      () {
+    fakeAsync((async) {
+      var fakeNow = Duration.zero;
+      final previousPolicy = serverTransactionPolicy;
+      serverTransactionPolicy = ServerTransactionPolicy(
+        mode: ServerTransactionMode.record,
+        recordAfter: const Duration(seconds: 3),
+        recordEvery: const Duration(seconds: 60),
+        idleLimit: const Duration(seconds: 30),
+        elapsed: () => fakeNow,
+      );
+      final logged = <String>[];
+      final previousPrint = driftRuntimeOptions.debugPrint;
+      driftRuntimeOptions.debugPrint = logged.add;
+      try {
+        final server = DriftServer(testInMemoryDatabase());
+        final c1 = StreamChannelController<Object?>();
+        final c2 = StreamChannelController<Object?>();
+        server.serve(c1.foreign, serialize: false);
+        server.serve(c2.foreign, serialize: false);
+
+        late DatabaseConnection conn1;
+        late DatabaseConnection conn2;
+        connectToRemoteAndInitialize(c1.local, serialize: false)
+            .then((c) => conn1 = c);
+        connectToRemoteAndInitialize(c2.local, serialize: false)
+            .then((c) => conn2 = c);
+        async.flushMicrotasks();
+
+        final user = CustomQueryExecutorUser(
+          schemaVersion: 1,
+          beforeOpenCallback: (_, __, ___) async {},
+        );
+        conn1.executor.ensureOpen(user);
+        conn2.executor.ensureOpen(user);
+        async.flushMicrotasks();
+
+        // Part 1: no waiter for 5s -> silent.
+        final noWaiterTxn = conn1.executor.beginTransaction();
+        noWaiterTxn.ensureOpen(user);
+        async.flushMicrotasks();
+        for (var i = 0; i < 5; i++) {
+          fakeNow += const Duration(seconds: 1);
+          async.elapse(const Duration(seconds: 1));
+        }
+        noWaiterTxn.send();
+        async.flushMicrotasks();
+        expect(logged.where((l) => l.startsWith('drift server: idle')), isEmpty);
+
+        // Part 2: busy transaction (statement every 300ms for 6s) with waiter -> silent.
+        final busyTxn = conn1.executor.beginTransaction();
+        busyTxn.ensureOpen(user);
+        async.elapse(Duration.zero);
+        var busyWaiterDone = false;
+        conn2.executor.runSelect('SELECT 1', const []).then((_) {
+          busyWaiterDone = true;
+        });
+        async.elapse(Duration.zero);
+        for (var i = 0; i < 20; i++) {
+          fakeNow += const Duration(milliseconds: 300);
+          async.elapse(const Duration(milliseconds: 300));
+          busyTxn.runSelect('SELECT 1', const []);
+          async.elapse(Duration.zero);
+        }
+        busyTxn.send();
+        async.elapse(Duration.zero);
+        expect(busyWaiterDone, isTrue);
+        expect(logged.where((l) => l.startsWith('drift server: idle')), isEmpty);
+
+        conn1.executor.close();
+        conn2.executor.close();
+        server.shutdown();
+        async.elapse(Duration.zero);
+      } finally {
+        driftRuntimeOptions.debugPrint = previousPrint;
+        serverTransactionPolicy = previousPolicy;
+      }
+    });
+  });
+
+  test(
+      'idle transaction detector: nested transaction inside beforeOpen records kind=before_open action=record_only',
+      () {
+    fakeAsync((async) {
+      var fakeNow = Duration.zero;
+      final previousPolicy = serverTransactionPolicy;
+      serverTransactionPolicy = ServerTransactionPolicy(
+        mode: ServerTransactionMode.record,
+        recordAfter: const Duration(seconds: 2),
+        recordEvery: const Duration(seconds: 60),
+        idleLimit: const Duration(seconds: 30),
+        elapsed: () => fakeNow,
+      );
+      final logged = <String>[];
+      final previousPrint = driftRuntimeOptions.debugPrint;
+      driftRuntimeOptions.debugPrint = logged.add;
+      try {
+        final server = DriftServer(testInMemoryDatabase());
+        final c1 = StreamChannelController<Object?>();
+        final c2 = StreamChannelController<Object?>();
+        server.serve(c1.foreign, serialize: false);
+        server.serve(c2.foreign, serialize: false);
+
+        late DatabaseConnection conn1;
+        late DatabaseConnection conn2;
+        connectToRemoteAndInitialize(c1.local, serialize: false)
+            .then((c) => conn1 = c);
+        connectToRemoteAndInitialize(c2.local, serialize: false)
+            .then((c) => conn2 = c);
+        async.flushMicrotasks();
+
+        final holdMigration = Completer<void>();
+        final migrationDb = TodoDb(conn1)
+          ..migration = MigrationStrategy(
+            onCreate: (m) async {
+              await m.database.transaction(() async {
+                await holdMigration.future;
+              });
+            },
+          );
+        final waiterDb = TodoDb(conn2);
+
+        migrationDb.customSelect('SELECT 1').get();
+        async.flushMicrotasks();
+        var waiterDone = false;
+        waiterDb.customSelect('SELECT 1').get().then((_) => waiterDone = true);
+        async.flushMicrotasks();
+
+        for (var i = 0; i < 3; i++) {
+          fakeNow += const Duration(seconds: 1);
+          async.elapse(const Duration(seconds: 1));
+        }
+
+        final idleLines = logged
+            .where((l) => l.startsWith('drift server: idle transaction:'))
+            .toList();
+        expect(idleLines, hasLength(1));
+        expect(idleLines.single, contains('kind=before_open'));
+        expect(idleLines.single, contains('action=record_only'));
+        expect(waiterDone, isFalse);
+
+        holdMigration.complete();
+        async.elapse(Duration.zero);
+        expect(waiterDone, isTrue);
+
+        migrationDb.close();
+        waiterDb.close();
+        server.shutdown();
+        async.elapse(Duration.zero);
+      } finally {
+        driftRuntimeOptions.debugPrint = previousPrint;
+        serverTransactionPolicy = previousPolicy;
+      }
+    });
   });
 }
 

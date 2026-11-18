@@ -202,6 +202,7 @@ class _RemoteTransactionExecutor extends _BaseExecutor
 
   Completer<bool>? _pendingOpen;
   bool _done = false;
+  bool _wasRevoked = false;
 
   @override
   SqlDialect get dialect => SqlDialect.sqlite;
@@ -329,4 +330,22 @@ class _RemoteStreamQueryStore extends StreamQueryStore {
     final updatesCopy = _awaitingUpdates.map((e) => e.future).toList();
     await Future.wait(updatesCopy);
   }
+}
+
+/// Returns the server-side executor id assigned to [executor] if it is a
+/// remote transaction executor that has completed opening on the server, or
+/// `null` otherwise.
+int? driftRemoteExecutorId(TransactionExecutor executor) {
+  if (executor is _RemoteTransactionExecutor) {
+    return executor._executorId;
+  }
+  return null;
+}
+
+/// Returns whether [executor] was observed to have been revoked by the server.
+bool driftWasRemoteTransactionRevoked(TransactionExecutor executor) {
+  if (executor is _RemoteTransactionExecutor) {
+    return executor._wasRevoked;
+  }
+  return false;
 }
