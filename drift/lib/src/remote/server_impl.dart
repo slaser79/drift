@@ -205,18 +205,51 @@ class ServerImplementation implements DriftServer {
     return _runWithTreeActivity(
       transactionId,
       () async {
+        final policy = serverTransactionPolicy;
+        final threshold = policy.slowStatementThreshold;
+        final started = threshold == null ? null : _now();
         switch (method) {
           case StatementMethod.custom:
             await executor.runCustom(sql, args);
+            _maybeLogSlowQuery(
+              policy: policy,
+              started: started,
+              method: method,
+              sql: sql,
+              rowCount: 0,
+            );
             return null;
           case StatementMethod.deleteOrUpdate:
-            return PrimitiveResponsePayload.int(
-                await executor.runDelete(sql, args));
+            final affected = await executor.runDelete(sql, args);
+            _maybeLogSlowQuery(
+              policy: policy,
+              started: started,
+              method: method,
+              sql: sql,
+              rowCount: affected,
+            );
+            return PrimitiveResponsePayload.int(affected);
           case StatementMethod.insert:
-            return PrimitiveResponsePayload.int(
-                await executor.runInsert(sql, args));
+            final id = await executor.runInsert(sql, args);
+            _maybeLogSlowQuery(
+              policy: policy,
+              started: started,
+              method: method,
+              sql: sql,
+              rowCount: id > 0 ? 1 : 0,
+            );
+            return PrimitiveResponsePayload.int(id);
           case StatementMethod.select:
-            return SelectResult(await executor.runSelect(sql, args));
+            final rows = await executor.runSelect(sql, args);
+            _maybeLogSlowQuery(
+              policy: policy,
+              started: started,
+              method: method,
+              sql: sql,
+              rowCount: rows.length,
+              selectRows: rows,
+            );
+            return SelectResult(rows);
         }
       },
       countStmt: true,
@@ -229,11 +262,176 @@ class ServerImplementation implements DriftServer {
     return _runWithTreeActivity(
       transactionId,
       () async {
+        final policy = serverTransactionPolicy;
+        final threshold = policy.slowStatementThreshold;
+        final started = threshold == null ? null : _now();
         await executor.runBatched(stmts);
+        if (started != null && threshold != null) {
+          final elapsed = _now() - started;
+          if (elapsed >= threshold) {
+            _logSlowStatement(
+              ms: elapsed.inMilliseconds,
+              kind: 'batch',
+              tables: _extractKnownTables(
+                stmts.statements,
+                policy.knownTables,
+              ),
+              rows: stmts.statements.length,
+              kb: 0,
+            );
+          }
+        }
         return null;
       },
       countStmt: true,
     );
+  }
+
+  static const Set<String> _knownSqlKinds = {
+    'select',
+    'insert',
+    'update',
+    'delete',
+    'begin',
+    'commit',
+    'rollback',
+    'savepoint',
+    'release',
+    'pragma',
+    'vacuum',
+    'create',
+    'drop',
+    'alter',
+    'with',
+    'analyze',
+  };
+  static final RegExp _commentsAndStringsRe = RegExp(
+    r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'",
+  );
+  static final RegExp _identRe = RegExp(r'[A-Za-z_][A-Za-z0-9_]*');
+
+  void _maybeLogSlowQuery({
+    required ServerTransactionPolicy policy,
+    required Duration? started,
+    required StatementMethod method,
+    required String sql,
+    required int rowCount,
+    List<Map<String, Object?>>? selectRows,
+  }) {
+    final threshold = policy.slowStatementThreshold;
+    if (started == null || threshold == null) return;
+    final elapsed = _now() - started;
+    if (elapsed < threshold) return;
+    try {
+      final kb = selectRows == null ? 0 : _estimateRowsKb(selectRows);
+      final stripped = sql.replaceAll(_commentsAndStringsRe, ' ');
+      final kind = _extractSqlKind(stripped, method);
+      final tables =
+          _extractKnownTablesFromStripped([stripped], policy.knownTables);
+      _logSlowStatement(
+        ms: elapsed.inMilliseconds,
+        kind: kind,
+        tables: tables,
+        rows: rowCount,
+        kb: kb,
+      );
+    } catch (_) {
+      // Diagnostics must not change what the server does.
+    }
+  }
+
+  String _extractSqlKind(String strippedSql, StatementMethod method) {
+    final first = _identRe.firstMatch(strippedSql);
+    if (first != null) {
+      final lower = first.group(0)!.toLowerCase();
+      if (_knownSqlKinds.contains(lower)) return lower;
+    }
+    return switch (method) {
+      StatementMethod.select => 'select',
+      StatementMethod.insert => 'insert',
+      StatementMethod.deleteOrUpdate => 'delete_or_update',
+      StatementMethod.custom => 'custom',
+    };
+  }
+
+  String _extractKnownTables(
+    List<String> statements,
+    Set<String> knownTables,
+  ) {
+    if (knownTables.isEmpty) return 'none';
+    final stripped = [
+      for (final s in statements) s.replaceAll(_commentsAndStringsRe, ' '),
+    ];
+    return _extractKnownTablesFromStripped(stripped, knownTables);
+  }
+
+  String _extractKnownTablesFromStripped(
+    List<String> strippedStatements,
+    Set<String> knownTables,
+  ) {
+    if (knownTables.isEmpty) return 'none';
+    final lowerMap = <String, String>{};
+    for (final t in knownTables) {
+      lowerMap[t.toLowerCase()] = t;
+    }
+    final matched = <String>[];
+    final seen = <String>{};
+    for (final sql in strippedStatements) {
+      for (final match in _identRe.allMatches(sql)) {
+        final token = match.group(0)!;
+        final canonical = knownTables.contains(token)
+            ? token
+            : lowerMap[token.toLowerCase()];
+        if (canonical != null && seen.add(canonical)) {
+          matched.add(canonical);
+          if (matched.length >= 4) return matched.join(',');
+        }
+      }
+    }
+    return matched.isEmpty ? 'none' : matched.join(',');
+  }
+
+  int _estimateRowsKb(List<Map<String, Object?>> rows) {
+    if (rows.isEmpty) return 0;
+    const maxSampleRows = 2000;
+    var sampled = 0;
+    var bytes = 0;
+    for (final row in rows) {
+      if (sampled >= maxSampleRows) break;
+      sampled++;
+      for (final value in row.values) {
+        if (value == null) continue;
+        if (value is String) {
+          bytes += value.length;
+        } else if (value is Uint8List) {
+          bytes += value.lengthInBytes;
+        } else {
+          bytes += 8;
+        }
+      }
+    }
+    if (sampled == 0 || bytes == 0) return 0;
+    final estimatedBytes = rows.length > sampled
+        ? (bytes * rows.length) ~/ sampled
+        : bytes;
+    return (estimatedBytes + 1023) ~/ 1024;
+  }
+
+  void _logSlowStatement({
+    required int ms,
+    required String kind,
+    required String tables,
+    required int rows,
+    required int kb,
+  }) {
+    try {
+      driftRuntimeOptions.debugPrint(
+        'drift server: slow statement: ms=${ms < 0 ? 0 : ms} '
+        'kind=$kind tables=$tables rows=${rows < 0 ? 0 : rows} kb=$kb',
+      );
+    } catch (_) {
+      // Logging must not change what the server does.
+    }
   }
 
   Future<QueryExecutor> _loadExecutor(int? transactionId) async {

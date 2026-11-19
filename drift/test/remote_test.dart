@@ -1129,6 +1129,211 @@ void main() {
       }
     });
   });
+
+  test(
+      'D0b: slow statement logging records fixed metadata with zero SQL or arg text',
+      () async {
+      final previousPrint = driftRuntimeOptions.debugPrint;
+      final previousPolicy = serverTransactionPolicy;
+      final printed = <String>[];
+      var now = Duration.zero;
+      var advancePerSelect = Duration.zero;
+      var advancePerBatch = Duration.zero;
+      var selectRowCount = 2;
+
+      final fakeInner = _SlowExecFake(
+        onSelect: () {
+          now += advancePerSelect;
+          if (selectRowCount > 2) {
+            return List.generate(
+              selectRowCount,
+              (_) => const {'secret_col': '1234567890123456'},
+            );
+          }
+          return [
+            {'secret_col': 'a' * 2048},
+            {'secret_col': 'b' * 2048},
+          ];
+        },
+        onBatch: () {
+          now += advancePerBatch;
+        },
+        onDeleteOrUpdate: () {
+          now += advancePerSelect;
+          return 1;
+        },
+      );
+
+      driftRuntimeOptions.debugPrint = printed.add;
+      serverTransactionPolicy = ServerTransactionPolicy(
+        elapsed: () => now,
+        slowStatementThreshold: const Duration(seconds: 2),
+        knownTables: const {'agent_run_state_records', 'chat_message_records'},
+      );
+
+      try {
+        final server = DriftServer(fakeInner, allowRemoteShutdown: true);
+        final controller = StreamChannelController<Object?>();
+        unawaited(server.serve(controller.foreign, serialize: false));
+
+        final conn = await connectToRemoteAndInitialize(
+          controller.local,
+          serialize: false,
+        );
+
+        // Fast query below 2 s emits nothing.
+        advancePerSelect = const Duration(milliseconds: 500);
+        await conn.executor.runSelect(
+          "SELECT secret_col FROM agent_run_state_records WHERE secret_col = 'SENSITIVE_USER_TEXT'",
+          const ['SECRET_ARG_VALUE'],
+        );
+        expect(
+          printed.where((l) => l.startsWith('drift server: slow statement:')),
+          isEmpty,
+        );
+
+        // Slow select >= 2 s emits metadata only (no SQL/args/unknown tables).
+        advancePerSelect = const Duration(milliseconds: 2500);
+        await conn.executor.runSelect(
+          "/* comment with secret_table */ SELECT secret_col FROM agent_run_state_records JOIN unknown_secret_tbl ON 1=1 WHERE body = 'USER_EMAIL_AT_EXAMPLE'",
+          const ['SECRET_ARG_2'],
+        );
+        final slowSelectLines = printed
+            .where((l) => l.startsWith('drift server: slow statement:'))
+            .toList();
+        expect(slowSelectLines, hasLength(1));
+        final line = slowSelectLines.single;
+        expect(line, contains('ms=2500'));
+        expect(line, contains('kind=select'));
+        expect(line, contains('tables=agent_run_state_records'));
+        expect(line, contains('rows=2'));
+        expect(line, contains('kb=4'));
+        expect(line, isNot(contains('SENSITIVE')));
+        expect(line, isNot(contains('SECRET')));
+        expect(line, isNot(contains('USER_EMAIL')));
+        expect(line, isNot(contains('unknown_secret_tbl')));
+        expect(line, isNot(contains('secret_col')));
+
+        // Slow batch >= 2 s emits kind=batch and statement count.
+        printed.clear();
+        advancePerBatch = const Duration(milliseconds: 2100);
+        await conn.executor.runBatched(
+          BatchedStatements(
+            const ['INSERT INTO chat_message_records(id) VALUES (?)'],
+            [
+              ArgumentsForBatchedStatement(0, const ['msg-secret-id']),
+              ArgumentsForBatchedStatement(0, const ['msg-secret-id-2']),
+            ],
+          ),
+        );
+        final slowBatchLines = printed
+            .where((l) => l.startsWith('drift server: slow statement:'))
+            .toList();
+        expect(slowBatchLines, hasLength(1));
+        final batchLine = slowBatchLines.single;
+        expect(batchLine, contains('ms=2100'));
+        expect(batchLine, contains('kind=batch'));
+        expect(batchLine, contains('tables=chat_message_records'));
+        expect(batchLine, contains('rows=1'));
+        expect(batchLine, contains('kb=0'));
+        expect(batchLine, isNot(contains('msg-secret-id')));
+
+        // Large select (>2000 rows) still estimates kb cleanly and stays bounded.
+        printed.clear();
+        selectRowCount = 2500;
+        await conn.executor.runSelect(
+          'SELECT secret_col FROM agent_run_state_records',
+          const [],
+        );
+        final bigLine = printed
+            .where((l) => l.startsWith('drift server: slow statement:'))
+            .single;
+        expect(bigLine, contains('rows=2500'));
+        expect(bigLine, contains('kb=40'));
+
+        // Update kind and null threshold disable check.
+        printed.clear();
+        await conn.executor.runUpdate(
+          'UPDATE agent_run_state_records SET status = ? WHERE run_id = ?',
+          const ['completed', 'run-secret-1'],
+        );
+        final updateLine = printed
+            .where((l) => l.startsWith('drift server: slow statement:'))
+            .single;
+        expect(updateLine, contains('kind=update'));
+        expect(updateLine, contains('tables=agent_run_state_records'));
+        expect(updateLine, isNot(contains('run-secret-1')));
+
+        printed.clear();
+        serverTransactionPolicy = ServerTransactionPolicy(
+          elapsed: () => now,
+          slowStatementThreshold: null,
+          knownTables: const {'agent_run_state_records'},
+        );
+        selectRowCount = 2;
+        await conn.executor.runSelect(
+          'SELECT secret_col FROM agent_run_state_records',
+          const [],
+        );
+        expect(
+          printed.where((l) => l.startsWith('drift server: slow statement:')),
+          isEmpty,
+        );
+
+        await conn.executor.close();
+        await server.shutdown();
+      } finally {
+        driftRuntimeOptions.debugPrint = previousPrint;
+        serverTransactionPolicy = previousPolicy;
+      }
+    });
+}
+
+class _SlowExecFake extends QueryExecutor {
+  _SlowExecFake({
+    required this.onSelect,
+    required this.onBatch,
+    required this.onDeleteOrUpdate,
+  });
+
+  final List<Map<String, Object?>> Function() onSelect;
+  final void Function() onBatch;
+  final int Function() onDeleteOrUpdate;
+
+  @override
+  SqlDialect get dialect => SqlDialect.sqlite;
+
+  @override
+  Future<bool> ensureOpen(QueryExecutorUser user) async => true;
+
+  @override
+  Future<List<Map<String, Object?>>> runSelect(
+    String statement,
+    List<Object?> args,
+  ) async =>
+      onSelect();
+
+  @override
+  Future<void> runBatched(BatchedStatements statements) async => onBatch();
+
+  @override
+  Future<int> runDelete(String statement, List<Object?> args) async =>
+      onDeleteOrUpdate();
+
+  @override
+  Future<int> runInsert(String statement, List<Object?> args) async => 1;
+
+  @override
+  Future<int> runUpdate(String statement, List<Object?> args) async => 0;
+
+  @override
+  Future<void> runCustom(String statement, [List<Object?>? args]) async {}
+
+  @override
+  TransactionExecutor beginTransaction() => throw UnimplementedError();
+
+  @override
+  QueryExecutor beginExclusive() => throw UnimplementedError();
 }
 
 Stream<Object?> _checkStreamOfSimple(Stream<Object?> source) {

@@ -38,6 +38,15 @@ final class ServerTransactionPolicy {
   /// [Stopwatch].
   final Duration Function()? elapsed;
 
+  /// Execution duration at or above which [ServerImplementation] emits
+  /// `drift server: slow statement:` via `driftRuntimeOptions.debugPrint`.
+  /// Set to `null` to disable slow-statement logging.
+  final Duration? slowStatementThreshold;
+
+  /// Privacy-safe schema allowlist used to populate `tables=` on slow-statement
+  /// lines without leaking dynamic identifiers or query content.
+  final Set<String> knownTables;
+
   /// Creates a server transaction policy.
   const ServerTransactionPolicy({
     this.mode = ServerTransactionMode.off,
@@ -45,6 +54,8 @@ final class ServerTransactionPolicy {
     this.recordAfter = const Duration(seconds: 10),
     this.recordEvery = const Duration(seconds: 60),
     this.elapsed,
+    this.slowStatementThreshold = const Duration(seconds: 2),
+    this.knownTables = const <String>{},
   });
 }
 
